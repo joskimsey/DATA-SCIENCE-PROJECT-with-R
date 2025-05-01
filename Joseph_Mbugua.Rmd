@@ -1,0 +1,560 @@
+---
+title: "From Data to Impact: Interactive Analysis of HIV and Child Mortality in the EAC(2000-2023)"
+author: "Joseph Kimani Mbugua"
+date: "2025-04-2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(sf)
+library(lme4)
+library(corrplot)
+```
+
+## Data Cleaning
+
+### HIV Data Cleaning
+load and clean the WHO HIV dataset (2000-2023).
+
+```{r load_hiv_data}
+hiv_data <- read_excel("HIV data 2000-2023.xlsx")
+
+# Function to extract central HIV estimate
+extract_estimate <- function(value) {
+  if (value == "No data") {
+    return(NA)
+  } else if (str_detect(value, "<")) {
+    num <- str_replace(value, "<", "")
+    return(as.numeric(num))
+  } else {
+    part <- str_split(value, "\\[")[[1]][1]
+    part <- str_trim(part)
+    part <- str_replace_all(part, " ", "")
+    return(as.numeric(part))
+  }
+}
+
+# Apply function and rename columns
+hiv_data <- hiv_data %>%
+  mutate(HIV_Estimate = sapply(Value, extract_estimate)) %>%
+  rename(Country = Location, Year = Period) %>%
+  select(Country, Year, HIV_Estimate, ParentLocationCode)
+head(hiv_data)
+```
+
+### Multidimensional Poverty Data Cleaning
+load and clean the World Bank multidimensional poverty dataset.
+
+```{r load_poverty_data}
+poverty_data <- read_excel("multidimensional_poverty.xlsx")
+
+# Select relevant columns and rename for clarity
+poverty_data <- poverty_data %>%
+  select(Economy, `Survey year`, `Multidimensional poverty headcount ratio (%)`, 
+         `Monetary (%)`, `Educational attainment (%)`, `Educational enrollment (%)`, 
+         `Electricity (%)`, `Sanitation (%)`, `Drinking water (%)`) %>%
+  rename(Country = Economy, Year = `Survey year`, MPI = `Multidimensional poverty headcount ratio (%)`, 
+         Monetary = `Monetary (%)`, Education_Attainment = `Educational attainment (%)`, 
+         Education_Enrollment = `Educational enrollment (%)`, Electricity = `Electricity (%)`, 
+         Sanitation = `Sanitation (%)`, Drinking_Water = `Drinking water (%)`)
+
+# Convert percentages to proportions
+poverty_data <- poverty_data %>%
+  mutate(across(MPI:Drinking_Water, ~ as.numeric(as.character(.)) / 100))
+head(poverty_data)
+```
+
+### Child Mortality Data Cleaning
+load and clean the UN IGME mortality datasets and integrate `dataset_datascience.csv` for EAC countries.
+
+```{r load_mortality_data, include=FALSE}
+neonatal_data <- read.csv("neonatal_mortality_rate.csv")
+under_five_data <- read.csv("under_five mortality rate.csv")
+datascience_data <- read.csv("dataset_datascience.csv")
+
+eac_countries <- c("Burundi", "Democratic Republic of the Congo", "Kenya", "Rwanda", 
+                   "South Sudan", "United Republic of Tanzania", "Uganda", "Somalia")
+
+# Filter for EAC countries
+colnames(datascience_data)
+colnames(neonatal_data)
+colnames(under_five_data)
+eac_neonatal <- neonatal_data %>% filter(`Geographic.area` %in% eac_countries)
+eac_under_five <- under_five_data %>% filter(`Geographic.area` %in% eac_countries)
+
+# Extract Year
+eac_neonatal$Year <- as.numeric(substr(eac_neonatal$TIME_PERIOD, 1, 4))
+eac_under_five$Year <- as.numeric(substr(eac_under_five$TIME_PERIOD, 1, 4))
+
+# Integrate datascience_data for neonatal and under-five mortality
+eac_ds_neonatal <- datascience_data %>%
+  filter(`Geographic.area` %in% eac_countries, Indicator == "Neonatal mortality rate") %>%
+  select(`Geographic.area`, `Reference.Date`, `Observation.Value`) %>%
+  rename(Country = `Geographic.area`, Year = `Reference.Date`, Neonatal_Rate = `Observation.Value`) %>%
+  mutate(Year = floor(Year))
+
+eac_ds_under_five <- datascience_data %>%
+  filter(`Geographic.area` %in% eac_countries, Indicator == "Under-five mortality rate") %>%
+  select(`Geographic.area`, `Reference.Date`, `Observation.Value`) %>%
+  rename(Country = `Geographic.area`, Year = `Reference.Date`, Under_Five_Rate = `Observation.Value`) %>%
+  mutate(Year = floor(Year))
+
+# Combine with existing data
+eac_neonatal_combined <- eac_neonatal %>%
+  select(`Geographic.area`, Year, OBS_VALUE) %>%
+  rename(Country = `Geographic.area`, Neonatal_Rate = OBS_VALUE) %>%
+  bind_rows(eac_ds_neonatal)
+
+eac_under_five_combined <- eac_under_five %>%
+  select(`Geographic.area`, Year, OBS_VALUE) %>%
+  rename(Country = `Geographic.area`, Under_Five_Rate = OBS_VALUE) %>%
+  bind_rows(eac_ds_under_five)
+```
+
+## Question 1: HIV Burden Analysis
+
+### Part A: Global HIV Burden (2000-2023)
+Identify countries contributing to 75% of the global HIV burden.
+
+```{r global_hiv_trend}
+
+# Filter data and select top countries
+hiv_data_filtered <- hiv_data %>% filter(Year >= 2000 & Year <= 2023)
+
+global_hiv <- hiv_data_filtered %>%
+  group_by(Country) %>%
+  summarise(Total_HIV = sum(HIV_Estimate, na.rm = TRUE)) %>%
+  arrange(desc(Total_HIV))
+
+total_global_hiv <- sum(global_hiv$Total_HIV, na.rm = TRUE)
+global_hiv <- global_hiv %>%
+  mutate(Cumulative_HIV = cumsum(Total_HIV),
+         Cumulative_Percent = Cumulative_HIV / total_global_hiv * 100) %>%
+  filter(Cumulative_Percent <= 75)
+
+# Limit to top 10 countries
+top_global_countries <- head(global_hiv$Country, 10)
+
+global_trends <- hiv_data_filtered %>% 
+  filter(Country %in% top_global_countries) %>%
+  mutate(HIV_Estimate_Millions = HIV_Estimate / 1000000)  # Scale to millions
+
+# Create ggplot
+p <- ggplot(global_trends, aes(x = Year, y = HIV_Estimate_Millions, color = Country, 
+                              text = paste("Country:", Country, "<br>Year:", Year, 
+                                           "<br>HIV Cases:", round(HIV_Estimate_Millions, 2), "M"))) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2, alpha = 0.7) +
+  scale_color_viridis_d(option = "C", begin = 0.1, end = 0.9) +
+  scale_y_continuous(labels = scales::number_format(suffix = "M")) +
+  scale_x_continuous(breaks = seq(2000, 2023, by = 5)) +
+  labs(title = "HIV Case Trends in Top 10 Countries (75% of Global Burden, 2000-2023)",
+       subtitle = "Number of people living with HIV, scaled to millions",
+       x = "Year",
+       y = "People Living with HIV (Millions)",
+       color = "Country") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90")
+  ) +
+  guides(color = guide_legend(nrow = 2))
+
+# Convert to plotly
+ggplotly(p, tooltip = "text") %>%
+  layout(
+    legend = list(orientation = "h", y = -0.2, x = 0.5, xanchor = "center"),
+    hoverlabel = list(bgcolor = "white", font = list(size = 12))
+  )
+```
+
+**Interpretation**: The plot highlights trends for countries accounting for 75% of global HIV cases, showing diverse trajectories over time.
+
+### Part B: Regional HIV Burden (2000-2023)
+Analyze the top 75% burden within each WHO region.
+
+```{r regional_hiv_trend}
+
+# Calculate regional HIV burden
+regional_hiv <- hiv_data_filtered %>%
+  group_by(ParentLocationCode, Country) %>%
+  summarise(Total_HIV = sum(HIV_Estimate, na.rm = TRUE)) %>%
+  arrange(ParentLocationCode, desc(Total_HIV))
+
+select_top_countries <- function(data) {
+  total_regional_hiv <- sum(data$Total_HIV, na.rm = TRUE)
+  data %>%
+    mutate(Cumulative_HIV = cumsum(Total_HIV),
+           Cumulative_Percent = Cumulative_HIV / total_regional_hiv * 100) %>%
+    filter(Cumulative_Percent <= 75)
+}
+
+top_regional_hiv <- regional_hiv %>%
+  group_by(ParentLocationCode) %>%
+  group_modify(~ select_top_countries(.)) %>%
+  ungroup()
+
+# Limit to top 3 countries per region
+top_regional_hiv <- top_regional_hiv %>%
+  group_by(ParentLocationCode) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+
+top_regional_countries <- top_regional_hiv$Country
+
+regional_trends <- hiv_data_filtered %>% 
+  filter(Country %in% top_regional_countries) %>%
+  mutate(HIV_Estimate_Millions = HIV_Estimate / 1000000)
+
+# Create ggplot
+p <- ggplot(regional_trends, aes(x = Year, y = HIV_Estimate_Millions, color = Country, 
+                                text = paste("Country:", Country, "<br>Year:", Year, 
+                                             "<br>HIV Cases:", round(HIV_Estimate_Millions, 2), "M"))) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2, alpha = 0.7) +
+  facet_wrap(~ ParentLocationCode, ncol = 2) +
+  scale_color_viridis_d(option = "C", begin = 0.1, end = 0.9) +
+  scale_y_continuous(labels = scales::number_format(suffix = "M")) +
+  scale_x_continuous(breaks = seq(2000, 2023, by = 5)) +
+  labs(title = "HIV Case Trends in Top Countries by WHO Region (2000-2023)",
+       subtitle = "Top 3 countries per region contributing to 75% of regional burden",
+       x = "Year",
+       y = "People Living with HIV (Millions)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(face = "bold"),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90"),
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+
+# Convert to plotly
+ggplotly(p, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(bgcolor = "white", font = list(size = 12)),
+    showlegend = FALSE
+  )
+```
+
+**Interpretation**: Regional trends reveal distinct patterns across WHO regions, with top countries driving the burden.
+
+### HIV and Poverty Relationship
+Merge HIV and poverty data and analyze their relationship.
+
+```{r merge_and_analyze}
+
+# Create merged_data
+merged_data <- poverty_data %>%
+  left_join(hiv_data, by = c("Country", "Year")) %>%
+  filter(!is.na(HIV_Estimate)) %>%
+  mutate(log_HIV = log(HIV_Estimate + 1))
+
+# Filter to complete cases for model variables
+model_data <- merged_data %>%
+  filter(complete.cases(select(., log_HIV, MPI, Monetary, Education_Attainment, 
+                              Education_Enrollment, Electricity, Sanitation, Drinking_Water)))
+
+# Check data
+print(dim(model_data))
+print(length(unique(model_data$Country)))
+print(table(model_data$Country))
+
+# Correlation matrix as interactive heatmap
+cor_matrix <- cor(model_data %>% select(log_HIV, MPI, Monetary, Education_Attainment, Education_Enrollment, Electricity, Sanitation,Drinking_Water), use = "complete.obs")
+
+# Convert correlation matrix to long format for plotly
+cor_data <- as.data.frame(as.table(cor_matrix))
+names(cor_data) <- c("Var1", "Var2", "Correlation")
+
+# Create heatmap
+p_cor <- plot_ly(data = cor_data, x = ~Var1, y = ~Var2, z = ~Correlation, type = "heatmap",
+                 colorscale = "Viridis", zmin = -1, zmax = 1,
+                 text = ~paste("Correlation:", round(Correlation, 2)),
+                 hoverinfo = "text") %>%
+  layout(
+    title = list(text = "Correlation Matrix of HIV and Poverty Indicators", 
+                 x = 0.5, xanchor = "center", font = list(size = 16, family = "Arial", weight = "bold")),
+    xaxis = list(title = "", tickangle = 45, titlefont = list(size = 14, family = "Arial", weight = "bold")),
+    yaxis = list(title = "", titlefont = list(size = 14, family = "Arial", weight = "bold")),
+    margin = list(b = 150),
+    hoverlabel = list(bgcolor = "white", font = list(size = 12))
+  )
+
+# Display heatmap
+p_cor
+
+# Fit the model on complete cases
+model <- lmer(log_HIV ~ MPI + Monetary + Education_Attainment + Education_Enrollment + 
+                Electricity + Sanitation + Drinking_Water + (1 | Year), 
+              data = model_data)
+summary(model)
+
+# Add predictions to model_data
+model_data$predicted <- predict(model)
+
+# Interactive scatter plot
+p_scatter <- ggplot(model_data, aes(x = log_HIV, y = predicted, 
+                                   text = paste("Country:", Country, 
+                                                "<br>Observed Log HIV:", round(log_HIV, 2), 
+                                                "<br>Predicted Log HIV:", round(predicted, 2)))) +
+  geom_point(size = 2, alpha = 0.7, color = viridis::viridis(1, begin = 0.4)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", size = 1.2) +
+  labs(title = "Observed vs. Predicted Log HIV Cases",
+       subtitle = "Predictions from mixed-effects model",
+       x = "Observed Log HIV",
+       y = "Predicted Log HIV") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90")
+  )
+
+# Convert to plotly
+ggplotly(p_scatter, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(bgcolor = "white", font = list(size = 12))
+  )
+```
+
+**Findings**: MPI and sanitation significantly predict HIV prevalence, with a 10% increase in MPI linked to a 6.2% rise in HIV cases.
+
+## Question 2: Child Mortality in East African Community (EAC)
+
+### Mapping Latest Mortality Estimates
+Map the latest mortality rates using shapefiles.
+
+```{r load_shapefiles}
+# Load shapefiles
+shp_files <- list.files("C:/Users/HP/Downloads/EAC_shapefiles", pattern = "\\.shp$", full.names = TRUE)
+eac_shp_list <- lapply(shp_files, st_read)
+eac_shp <- do.call(rbind, eac_shp_list)
+
+# Convert geometry to MULTIPOLYGON to avoid sfc_GEOMETRY issues
+eac_shp <- st_cast(eac_shp, "MULTIPOLYGON")
+
+# Create latest neonatal mortality data
+latest_neonatal <- eac_neonatal_combined %>%
+  group_by(Country) %>%
+  filter(Year == max(Year, na.rm = TRUE)) %>%
+  select(Country, Neonatal_Rate)
+
+# Create latest under-five mortality data
+latest_under_five <- eac_under_five_combined %>%
+  group_by(Country) %>%
+  filter(Year == max(Year, na.rm = TRUE)) %>%
+  select(Country, Under_Five_Rate)
+
+# Check country names in shapefile and data
+print("Shapefile countries:")
+print(unique(eac_shp$COUNTRY))
+print("Neonatal data countries:")
+print(unique(latest_neonatal$Country))
+print("Under-five data countries:")
+print(unique(latest_under_five$Country))
+
+# Standardize country names
+latest_neonatal <- latest_neonatal %>%
+  mutate(Country = case_when(
+    Country == "United Republic of Tanzania" ~ "Tanzania",
+    Country == "Democratic Republic of the Congo" ~ "DR Congo",
+    TRUE ~ Country
+  ))
+
+latest_under_five <- latest_under_five %>%
+  mutate(Country = case_when(
+    Country == "United Republic of Tanzania" ~ "Tanzania",
+    Country == "Democratic Republic of the Congo" ~ "DR Congo",
+    TRUE ~ Country
+  ))
+
+# Join with shapefile
+eac_map_neonatal <- eac_shp %>%
+  left_join(latest_neonatal, by = c("COUNTRY" = "Country"))
+
+eac_map_under_five <- eac_shp %>%
+  left_join(latest_under_five, by = c("COUNTRY" = "Country"))
+
+# Calculate colorbar ticks for neonatal map
+neo_range <- range(eac_map_neonatal$Neonatal_Rate, na.rm = TRUE)
+neo_ticks <- seq(floor(neo_range[1]), ceiling(neo_range[2]), length.out = 5)
+
+# Neonatal map
+p_neo <- ggplot(eac_map_neonatal) +
+  geom_sf(aes(fill = Neonatal_Rate, 
+              text = paste("Country:", COUNTRY, "<br>Neonatal Rate:", round(Neonatal_Rate, 2)))) +
+  scale_fill_viridis_c(option = "C", begin = 0.1, end = 0.9, labels = scales::number_format()) +
+  labs(title = "Latest Neonatal Mortality Rates in EAC Countries",
+       subtitle = paste("Data from", max(latest_neonatal$Year, na.rm = TRUE)),
+       fill = "Mortality Rate (per 1,000 live births)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# Convert neonatal map to plotly
+p_neo_plotly <- ggplotly(p_neo, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(bgcolor = "white", font = list(size = 12)),
+    colorbar = list(
+      title = list(text = "Mortality Rate (per 1,000)", font = list(size = 12)),
+      tickvals = neo_ticks,
+      ticktext = round(neo_ticks, 1),
+      tickfont = list(size = 10)
+    ),
+    margin = list(t = 100, b = 100, l = 50, r = 50)
+  )
+
+# Calculate colorbar ticks for under-five map
+u5_range <- range(eac_map_under_five$Under_Five_Rate, na.rm = TRUE)
+u5_ticks <- seq(floor(u5_range[1]), ceiling(u5_range[2]), length.out = 5)
+
+# Under-five map
+p_u5 <- ggplot(eac_map_under_five) +
+  geom_sf(aes(fill = Under_Five_Rate, 
+              text = paste("Country:", COUNTRY, "<br>Under-Five Rate:", round(Under_Five_Rate, 2)))) +
+  scale_fill_viridis_c(option = "C", begin = 0.1, end = 0.9, labels = scales::number_format()) +
+  labs(title = "Latest Under-Five Mortality Rates in EAC Countries",
+       subtitle = paste("Data from", max(latest_under_five$Year, na.rm = TRUE)),
+       fill = "Mortality Rate (per 1,000 live births)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# Convert under-five map to plotly
+p_u5_plotly <- ggplotly(p_u5, tooltip = "text") %>%
+  layout(
+    hoverlabel = list(bgcolor = "white", font = list(size = 12)),
+    colorbar = list(
+      title = list(text = "Mortality Rate (per 1,000)", font = list(size = 12)),
+      tickvals = u5_ticks,
+      ticktext = round(u5_ticks, 1),
+      tickfont = list(size = 10)
+    ),
+    margin = list(t = 100, b = 100, l = 50, r = 50)
+  )
+
+# Display both maps
+p_neo_plotly
+p_u5_plotly
+```
+
+**Interpretation**: Maps show spatial disparities in mortality rates across EAC countries.
+
+### Part C: Average Trends Over Time
+Plot trends with average mortality rates.
+
+```{r mortality_trends}
+# Calculate average under-five mortality by year
+avg_under_five <- eac_under_five_combined %>% 
+  group_by(Year) %>% 
+  summarize(Average_Under_Five = mean(Under_Five_Rate, na.rm = TRUE))
+
+# Create ggplot
+p_u5 <- ggplot() +
+  geom_line(data = avg_under_five, aes(x = Year, y = Average_Under_Five, 
+                                      text = paste("Average Under-Five Rate:", round(Average_Under_Five, 2))), 
+            color = "blue", size = 1.2) +
+  geom_point(data = eac_under_five_combined, 
+             aes(x = Year, y = Under_Five_Rate, color = Country, 
+                 text = paste("Country:", Country, "<br>Year:", Year, 
+                              "<br>Under-Five Rate:", round(Under_Five_Rate, 2))), 
+             alpha = 0.5, size = 2) +
+  scale_color_viridis_d(option = "C", begin = 0.1, end = 0.9) +
+  scale_y_continuous(labels = scales::number_format(), 
+                     breaks = seq(floor(min(eac_under_five_combined$Under_Five_Rate, na.rm = TRUE)), 
+                                 ceiling(max(eac_under_five_combined$Under_Five_Rate, na.rm = TRUE)), 
+                                 length.out = 5)) +
+  scale_x_continuous(breaks = seq(min(eac_under_five_combined$Year, na.rm = TRUE), 
+                                 max(eac_under_five_combined$Year, na.rm = TRUE), by = 5)) +
+  labs(title = "Under-Five Mortality Trend in EAC Countries",
+       x = "Year",
+       y = "Mortality Rate (per 1,000 live births)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90")
+  ) +
+  guides(color = guide_legend(nrow = 2, title = "Country"))
+
+# Convert to plotly
+ggplotly(p_u5, tooltip = "text") %>%
+  layout(
+    legend = list(orientation = "h", y = -0.25, x = 0.5, xanchor = "center", 
+                  font = list(size = 10)),
+    hoverlabel = list(bgcolor = "white", font = list(size = 12)),
+    margin = list(t = 100, b = 150, l = 50, r = 50)
+  )
+```
+
+**Interpretation**: Trends indicate a general decline, with variability among countries.
+
+### Part D: Highest Mortality Rates
+Identify countries with the highest rates.
+
+```{r highest_mortality}
+highest_neonatal <- latest_neonatal %>% 
+  arrange(desc(Neonatal_Rate)) %>% 
+  select(Country, Neonatal_Rate) %>% 
+  head(3)
+print(highest_neonatal)
+
+highest_under_five <- latest_under_five %>% 
+  arrange(desc(Under_Five_Rate)) %>% 
+  select(Country, Under_Five_Rate) %>% 
+  head(3)
+print(highest_under_five)
+```
+
+**Findings**: The Democratic Republic of the Congo consistently shows high mortality rates, highlighting regional health disparities.
+
+---
+
+
+
+
+
+
+-
